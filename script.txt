@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -e
+
+# Clean old lab if it exists
+for ns in pc1 pc2 pc3 pc4 rtr; do ip netns del "$ns" 2>/dev/null || true; done
+ip link del br0 2>/dev/null || true
+
+# 1) VLAN-aware "switch"
+ip link add br0 type bridge vlan_filtering 1
+ip link set br0 up
+
+# 2) Router namespace + trunk to the switch (for inter-VLAN routing)
+ip netns add rtr
+ip link add rtr-trunk type veth peer name br-trunk
+ip link set rtr-trunk netns rtr
+ip link set br-trunk up
+ip link set br-trunk master br0
+for vid in 10 20 30 40; do bridge vlan add dev br-trunk vid $vid; done
+
+# Helper to make a PC on an access port
+make_pc() {
+  local name=$1 vid=$2 ipaddr=$3 gw=$4
+  ip netns add "$name"
+  ip link add ${name}-eth type veth peer name br-${name}
+  ip link set ${name}-eth netns "$name"
+  ip link set br-${name} up
+  ip link set br-${name} master br0
+  # Access port: untagged on $vid with PVID
+  bridge vlan add dev br-${name} vid $vid pvid untagged
+  bridge vlan del dev br-${name} vid 1 2>/dev/null || true
+
+  ip -n "$name" link set lo up
+  ip -n "$name" link set ${name}-eth up
+  ip -n "$name" addr add "$ipaddr" dev ${name}-eth
+  ip -n "$name" route add default via "$gw"
+}
+
+# 3) Four PCs on four VLANs
+make_pc pc1 10 10.10.10.10/24 10.10.10.1
+make_pc pc2 20 10.20.20.10/24 10.20.20.1
+make_pc pc3 30 10.30.30.10/24 10.30.30.1
+make_pc pc4 40 10.40.40.10/24 10.40.40.1
+
+# 4) Router-on-a-stick: one link, subinterfaces per VLAN
+ip -n rtr link set lo up
+ip -n rtr link set rtr-trunk up
+for vid in 10 20 30 40; do
+  ip -n rtr link add link rtr-trunk name rtr-trunk.$vid type vlan id $vid
+  ip -n rtr link set rtr-trunk.$vid up
+done
+ip -n rtr addr add 10.10.10.1/24 dev rtr-trunk.10
+ip -n rtr addr add 10.20.20.1/24 dev rtr-trunk.20
+ip -n rtr addr add 10.30.30.1/24 dev rtr-trunk.30
+ip -n rtr addr add 10.40.40.1/24 dev rtr-trunk.40
+ip netns exec rtr sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+echo "✅ Lab ready.
+
+Test isolation & routing:
+  ip netns exec pc1 ping -c2 10.10.10.1    # pc1 -> its gateway (should work)
+  ip netns exec pc1 ping -c2 10.20.20.10   # pc1 -> pc2 (works because router is on)
+  ip netns exec pc1 ping -c2 10.10.10.10   # pc1 -> itself (works)
+
+Show VLANs on the switch:
+  bridge vlan show
+
+Tear down:
+  sudo bash -c 'for ns in pc1 pc2 pc3 pc4 rtr; do ip netns del $ns 2>/dev/null || true; done; ip link del br0 2>/dev/null || true'
+"
